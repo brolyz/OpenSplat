@@ -4,6 +4,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <deque>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -11,15 +12,16 @@
 #include <torch/torch.h>
 #include "image_store.hpp"
 
-// A decoded camera image resident on the training device
+// A frame owned by a caller on the training device. The prefetch pool keeps
+// only CPU uint8 images/masks; device tensors are created by acquire().
 struct Frame{
     torch::Tensor image; // uint8 [H,W,3]
-    torch::Tensor mask;  // float [H,W] in {0,1}, or undefined
+    torch::Tensor mask;  // CPU pool: uint8; acquired: float [H,W] in {0,1}
     torch::Tensor edges; // float [H,W] in {0,1}, or undefined
     int imageId = -1;
     int level = 1;
 };
-// Keeps the frame buffer reserved while the frame is in use
+// Owns the tensors independently of the prefetch pool and pipeline lifetime.
 using FrameLease = std::shared_ptr<const Frame>;
 
 class ImagePipeline{
@@ -37,7 +39,7 @@ private:
     struct Request{ int imageId; int level; int width; int height; bool hasMask; };
 
     void workerLoop();
-    Slot *reserveSlotLocked(const Request &r);
+    Slot *reserveSlotLocked();
     void decodeInto(Slot &slot, const Request &r);
     void retuneLocked(bool waited);
 
@@ -50,6 +52,7 @@ private:
     std::condition_variable queueCv;
     std::condition_variable readyCv;
     bool stopping = false;
+    std::exception_ptr failure;
 
     std::atomic<int> target{2};
     int capacity = 4;
@@ -61,8 +64,6 @@ private:
     int stepsTotal = 0;
     int stepsSinceRetune = 0;
     uint64_t useCounter = 0;
-    uint64_t maxSlotBytes = 0;
-    uint64_t frameBudget = 0; // device bytes the frame pool may hold, sampled at the first retune
 };
 
 #endif

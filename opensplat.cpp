@@ -8,7 +8,6 @@
 #include "zip_utils.hpp"
 #include "image_store.hpp"
 #include "image_pipeline.hpp"
-#include "sysinfo.hpp"
 #include <chrono>
 #include <cxxopts.hpp>
 
@@ -146,9 +145,9 @@ int main(int argc, char *argv[]){
         }
         if (numMasks > 0) std::cout << "Found " << numMasks << " masks" << std::endl;
 
-        // Images are preprocessed once into a compressed cache (90% of RAM,
-        // saving to disk next to the scene) and decoded on demand while training
-        ImageStore imageStore(physicalRamBytes() / 10 * 9, sceneDir);
+        // Keep compressed images in RAM and decode a small CPU lookahead pool.
+        // Only the frame used by training is uploaded to the device.
+        ImageStore imageStore;
         imageStore.prepare(inputData.cameras, downScaleFactor, numDownscales);
 
         // Withhold a validation camera if necessary
@@ -216,20 +215,29 @@ int main(int argc, char *argv[]){
                 images.request(cams[camsIter.peek(k)], model.getDownscaleFactor(step + 1 + k));
             }
 
-            torch::Tensor rgb = model.forward(cam, step);
-            FrameLease frame = images.acquire(cam, model.getDownscaleFactor(step));
-            torch::Tensor gt = frame->image;
-            torch::Tensor mask = frame->mask;
+            {
+                torch::Tensor rgb = model.forward(cam, step);
+                FrameLease frame = images.acquire(cam, model.getDownscaleFactor(step));
+                torch::Tensor gt = frame->image;
+                torch::Tensor mask = frame->mask;
 
-            torch::Tensor mainLoss = model.mainLoss(rgb, gt, mask, ssimWeight);
-            mainLoss.backward();
-            frame.reset();
+                torch::Tensor mainLoss = model.mainLoss(rgb, gt, mask, ssimWeight);
+                mainLoss.backward();
 
-            if (step % displayStep == 0) {
-                const float percentage = static_cast<float>(step) / numIters;
-                std::cout << "Step " << step << ": " << mainLoss.item<float>() << " [" << floor(percentage * 100) << "%]" <<  std::endl;
+                if (step % displayStep == 0) {
+                    const float percentage = static_cast<float>(step) / numIters;
+                    std::cout << "Step " << step << ": " << mainLoss.item<float>() << " [" << floor(percentage * 100) << "%]" <<  std::endl;
+                }
+#ifdef USE_VISUALIZATION
+                if (hasVisualization) {
+                    visualizer.SetLoss(step, mainLoss.item<float>());
+                    visualizer.SetImage(rgb, gt);
+                }
+#endif
             }
 
+            // Release the training frame/graph before multiview scoring uploads
+            // another image, so reference frames do not overlap on the GPU.
             model.afterTrain(step);
             model.optimizerStepCadence(step);
             model.schedulersStep(step);
@@ -250,10 +258,8 @@ int main(int argc, char *argv[]){
 #ifdef USE_VISUALIZATION
             if (hasVisualization) {
                 visualizer.SetInitialGaussianNum(inputData.points.xyz.size(0));
-                visualizer.SetLoss(step, mainLoss.item<float>());
                 visualizer.SetGaussians(model.means, model.scales, model.featuresDc,
                                         model.opacities);
-                visualizer.SetImage(rgb, gt);
                 if (visualizer.QuitApp())
                     step = numIters + 1;
                 visualizer.Draw();

@@ -2,60 +2,58 @@
 #define IMAGE_STORE_H
 
 #include <cstdint>
-#include <filesystem>
-#include <list>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <stdexcept>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 #include "input_data.hpp"
 
 using Blob = std::shared_ptr<const std::vector<uint8_t>>;
 
-// Thread-safe cache of compressed image bytes with a RAM cap. Least recently
-// used entries are saved to a per-process directory under baseDir and reloaded on demand
+// Thread-safe, RAM-only cache of compressed image bytes. Decoded frames are
+// bounded separately by ImagePipeline; compressed blobs never spill to disk.
 class BlobCache{
 public:
-    BlobCache(uint64_t capBytes, const std::filesystem::path &baseDir);
-    ~BlobCache();
-
-    void put(const std::string &key, std::vector<uint8_t> &&bytes);
-    Blob get(const std::string &key);
-    bool has(const std::string &key) const;
-    uint64_t residentBytes() const { return resident; }
-    uint64_t capacityBytes() const { return cap; }
+    void put(const std::string &key, std::vector<uint8_t> &&bytes){
+        Blob blob = std::make_shared<const std::vector<uint8_t>>(std::move(bytes));
+        std::lock_guard<std::mutex> lock(m);
+        Blob &entry = map[key];
+        if (entry) resident -= entry->size();
+        resident += blob->size();
+        entry = std::move(blob);
+    }
+    Blob get(const std::string &key) const{
+        std::lock_guard<std::mutex> lock(m);
+        auto it = map.find(key);
+        if (it == map.end()) throw std::runtime_error("Image blob not found: " + key);
+        return it->second;
+    }
+    uint64_t residentBytes() const{
+        std::lock_guard<std::mutex> lock(m);
+        return resident;
+    }
 
 private:
-    struct Entry{
-        Blob bytes; // null when saved
-        uint64_t size = 0;
-        bool saved = false;
-        std::list<std::string>::iterator lru;
-    };
-    void touchLocked(Entry &e, const std::string &key);
-    void evictLocked(const std::string &keep);
-    std::filesystem::path savePath(const std::string &key) const;
-
     mutable std::mutex m;
-    std::unordered_map<std::string, Entry> map;
-    std::list<std::string> lru; // front = most recently used
+    std::unordered_map<std::string, Blob> map;
     uint64_t resident = 0;
-    uint64_t cap;
-    bool lowRamGuardTripped = false;
-    std::filesystem::path saveDir;
 };
 
 // Preprocesses every camera image once (resize, undistort, downscale levels)
 // into compressed blobs and updates the camera intrinsics and dimensions
 struct ImageStore{
-    ImageStore(uint64_t capBytes, const std::filesystem::path &baseDir);
-
     void prepare(std::vector<Camera> &cameras, float downscaleFactor, int numDownscales);
     void prepareCamera(Camera &cam, float downscaleFactor);
 
-    static std::string imageKey(int imageId, int level);
-    static std::string maskKey(int imageId, int level);
+    static std::string imageKey(int imageId, int level){
+        return "i:" + std::to_string(imageId) + ":" + std::to_string(level);
+    }
+    static std::string maskKey(int imageId, int level){
+        return "m:" + std::to_string(imageId) + ":" + std::to_string(level);
+    }
 
     BlobCache cache;
     int numLevels = 1;

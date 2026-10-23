@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <atomic>
 #include <fstream>
+#include <filesystem>
 #include <iostream>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
@@ -10,120 +11,6 @@
 #include "utils.hpp"
 
 namespace fs = std::filesystem;
-
-static const std::string savePrefix = "opensplat-cache-";
-
-BlobCache::BlobCache(uint64_t capBytes, const fs::path &baseDir) : cap(capBytes){
-    // Remove save directories left behind by crashed runs
-    std::error_code ec;
-    for (const auto &entry : fs::directory_iterator(baseDir, ec)){
-        std::string name = entry.path().filename().string();
-        if (name.rfind(savePrefix, 0) != 0) continue;
-        int pid = std::atoi(name.substr(savePrefix.size()).c_str());
-        if (pid > 0 && pid != currentPid() && !processAlive(pid)){
-            fs::remove_all(entry.path(), ec);
-        }
-    }
-
-    saveDir = baseDir / (savePrefix + std::to_string(currentPid()));
-}
-
-BlobCache::~BlobCache(){
-    std::error_code ec;
-    fs::remove_all(saveDir, ec);
-}
-
-fs::path BlobCache::savePath(const std::string &key) const{
-    std::string name = key;
-    std::replace(name.begin(), name.end(), ':', '_');
-    return saveDir / (name + ".bin");
-}
-
-void BlobCache::touchLocked(Entry &e, const std::string &key){
-    lru.erase(e.lru);
-    lru.push_front(key);
-    e.lru = lru.begin();
-}
-
-// Saves least recently used blobs to disk until resident bytes fit the cap
-void BlobCache::evictLocked(const std::string &keep){
-    if (resident <= cap) return;
-
-    if (!lowRamGuardTripped && availableRamBytes() < physicalRamBytes() / 10){
-        cap = (std::max)(cap / 2, static_cast<uint64_t>(64) << 20);
-        lowRamGuardTripped = true;
-    }
-
-    auto it = lru.end();
-    while (resident > cap && it != lru.begin()){
-        --it;
-        if (*it == keep) continue;
-        Entry &e = map[*it];
-        if (!e.bytes) continue;
-        if (!e.saved){
-            std::error_code ec;
-            fs::create_directories(saveDir, ec);
-            std::ofstream f(savePath(*it), std::ios::binary);
-            f.write(reinterpret_cast<const char *>(e.bytes->data()), e.bytes->size());
-            if (!f) throw std::runtime_error("Cannot write image cache file in " + saveDir.string());
-            e.saved = true;
-        }
-        resident -= e.size;
-        e.bytes.reset();
-    }
-}
-
-void BlobCache::put(const std::string &key, std::vector<uint8_t> &&bytes){
-    std::lock_guard<std::mutex> lock(m);
-    auto it = map.find(key);
-    if (it != map.end()){
-        if (it->second.bytes) resident -= it->second.size;
-        lru.erase(it->second.lru);
-        map.erase(it);
-    }
-    Entry e;
-    e.size = bytes.size();
-    e.bytes = std::make_shared<const std::vector<uint8_t>>(std::move(bytes));
-    lru.push_front(key);
-    e.lru = lru.begin();
-    resident += e.size;
-    map[key] = e;
-    evictLocked(key);
-}
-
-Blob BlobCache::get(const std::string &key){
-    std::lock_guard<std::mutex> lock(m);
-    auto it = map.find(key);
-    if (it == map.end()) throw std::runtime_error("Image blob not found: " + key);
-    Entry &e = it->second;
-    if (!e.bytes){
-        std::ifstream f(savePath(key), std::ios::binary);
-        if (!f) throw std::runtime_error("Cannot reload saved image " + key);
-        auto data = std::make_shared<std::vector<uint8_t>>(e.size);
-        f.read(reinterpret_cast<char *>(data->data()), e.size);
-        e.bytes = data;
-        resident += e.size;
-    }
-    touchLocked(e, key);
-    Blob b = e.bytes;
-    evictLocked(key);
-    return b;
-}
-
-bool BlobCache::has(const std::string &key) const{
-    std::lock_guard<std::mutex> lock(m);
-    return map.find(key) != map.end();
-}
-
-ImageStore::ImageStore(uint64_t capBytes, const fs::path &baseDir) : cache(capBytes, baseDir){}
-
-std::string ImageStore::imageKey(int imageId, int level){
-    return "i:" + std::to_string(imageId) + ":" + std::to_string(level);
-}
-
-std::string ImageStore::maskKey(int imageId, int level){
-    return "m:" + std::to_string(imageId) + ":" + std::to_string(level);
-}
 
 static bool isJpegOrPng(const std::string &path){
     std::string ext = fs::path(path).extension().string();

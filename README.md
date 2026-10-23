@@ -228,6 +228,26 @@ There's several parameters you can tune. To view the full list:
 
 To run OpenSplat in Google Colab follow this [example notebook](https://colab.research.google.com/drive/1USqQsIBcqdOP6Fy0aVAyoXzTdpaEoTL_).
 
+### Image memory
+
+Preprocessed images and masks are cached as compressed bytes entirely in RAM;
+the image cache does not write temporary files to disk. The compressed dataset
+must fit in RAM alongside the model and working buffers. A bounded CPU lookahead
+pool decodes images in advance (up to 14 frames, with masks kept as bytes).
+Only the frame requested by training or multiview scoring is copied to the GPU.
+Masks and edge maps are converted for that request and are not cached in VRAM.
+Compression, undistortion, masks, multiview densification and the fused loss
+remain available without retaining a dataset cache on the GPU.
+
+Total VRAM still depends on resolution, gaussian count, optimizer state and
+temporary rasterization/densification buffers. To use the progressive resolution
+schedule that was the default in 1.1.5, add `--num-downscales 2
+--resolution-schedule 3000`; the current default starts at full resolution.
+
+To build and run the image pipeline regression tests, configure with
+`-DOPENSPLAT_BUILD_TESTS=ON`, build, then run `ctest --test-dir build
+--output-on-failure`. The CUDA check is skipped when CUDA is unavailable.
+
 ### Compression
 
 To generate compressed splats (.splat files), use the `-o` option:
